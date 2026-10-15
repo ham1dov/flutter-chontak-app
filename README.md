@@ -16,7 +16,7 @@ The app is **offline-first**. Every change is written to app-local storage first
 
 ## Supabase setup
 
-1. Create a Supabase project and run [`supabase/schema.sql`](supabase/schema.sql) in the SQL editor.
+1. Create a Supabase project and run [`supabase/new_project_schema.sql`](supabase/new_project_schema.sql) in the SQL editor (it is safe to run twice). It creates the `transactions` and `profiles` tables, Row Level Security, and protection against an old offline edit overwriting a newer one. `supabase/schema.sql` is the older, smaller version and is not needed on a fresh project.
 2. **Authentication → Providers → Email:** enable it. (Keep "Confirm email" on if you want verified addresses; the app tells the user to open the confirmation link.)
 3. **Authentication → Providers → Google:** enable it and paste a Google OAuth *Web application* client ID and secret ([Supabase guide](https://supabase.com/docs/guides/auth/social-login/auth-google)). In Google Cloud Console add the callback URL shown by Supabase (`https://YOUR_PROJECT.supabase.co/auth/v1/callback`) as an authorized redirect URI.
 4. **Authentication → URL Configuration → Redirect URLs:** add `com.chontak.financetracker://login-callback/`.
