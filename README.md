@@ -2,15 +2,26 @@
 
 Native Flutter version of the linked finance tracker dashboard. It keeps monthly income, expense, and balance totals, a 12-month trend, date-filtered category charts, and transaction notes/categories.
 
-## Local use
+## How data is stored
 
-Transactions and currency are written to app-local storage first. The app works without an account and without a network connection. Local-only data stays on that installation; clearing app data or changing devices will lose access to it.
+The app is **offline-first**. Every change is written to app-local storage first, so it works with no account and no network.
 
-## Supabase sync
+- **Signed out:** records stay on the device only.
+- **Signed in:** records are also synced with your Supabase (Postgres) account. Whenever the device is online (on app start, when the connection returns, when the app is reopened, or after each change) the app
+  1. downloads your cloud records into local storage, and
+  2. uploads every local record the cloud is missing or has an older version of.
+  The newest edit of a record wins. Nothing is ever deleted from local storage by a sync, and a failed sync is retried automatically.
+- **First sign-in:** records you created while signed out or offline are adopted into your account and uploaded.
+- **Several accounts on one device:** each account has its own local copy. Signing out keeps it on the device (it comes back when you sign in again) and a different account never sees it.
 
-1. Create a Supabase project and enable **Anonymous Sign-Ins** in Authentication settings.
-2. Run [`supabase/schema.sql`](supabase/schema.sql) in the Supabase SQL editor.
-3. Build with the project URL and anon/public key:
+## Supabase setup
+
+1. Create a Supabase project and run [`supabase/schema.sql`](supabase/schema.sql) in the SQL editor.
+2. **Authentication → Providers → Email:** enable it. (Keep "Confirm email" on if you want verified addresses; the app tells the user to open the confirmation link.)
+3. **Authentication → Providers → Google:** enable it and paste a Google OAuth *Web application* client ID and secret ([Supabase guide](https://supabase.com/docs/guides/auth/social-login/auth-google)). In Google Cloud Console add the callback URL shown by Supabase (`https://YOUR_PROJECT.supabase.co/auth/v1/callback`) as an authorized redirect URI.
+4. **Authentication → URL Configuration → Redirect URLs:** add `com.chontak.financetracker://login-callback/`.
+5. Anonymous sign-ins are no longer used and can be turned off.
+6. Build with the project URL and anon/public key:
 
 ```sh
 flutter build apk --release \
@@ -18,10 +29,14 @@ flutter build apk --release \
   --dart-define=SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
 ```
 
-There is no sign-in screen. Supabase creates an anonymous identity on the first successful online sync. Its session is stored on that installation; a new device or cleared app data creates a different anonymous identity and cannot recover the old records. Records are saved locally first and uploaded when connectivity returns. RLS limits each anonymous identity to its own rows.
+Row Level Security limits each account to its own rows. Without those two build-time values the app stays local-only and shows **Device only**.
 
-Without those two build-time values, the app remains local-only and shows **Device only** in its sync status.
+The auth callback deep link (`com.chontak.financetracker://login-callback/`) is declared in `android/app/src/main/AndroidManifest.xml` and `_authRedirect` in `lib/main.dart`; change all three places together if you rename it.
 
 ## Build
 
 Run `flutter pub get`, then use the build command above. The release APK is written to `build/app/outputs/flutter-apk/app-release.apk`.
+
+## Tests
+
+`flutter test test/finance_entry_test.dart`

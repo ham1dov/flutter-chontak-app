@@ -9,8 +9,16 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
+part 'auth_screen.dart';
+
 const _supabaseUrl = String.fromEnvironment('SUPABASE_URL');
 const _supabaseAnonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
+/// Deep link Supabase redirects back to after Google sign-in / email confirmation.
+/// Must match the intent filter in AndroidManifest.xml and the Supabase redirect URLs.
+const _authRedirect = 'com.chontak.financetracker://login-callback/';
+const _guestEntriesKey = 'finance.entries.v1';
+// Where supabase_flutter 2.x persists the session (see SharedPreferencesLocalStorage).
+final _sessionStorageKey = 'sb-${Uri.parse(_supabaseUrl).host.split('.').first}-auth-token';
 const _green = Color(0xFF2ECC71);
 const _red = Color(0xFFE74C3C);
 const _blue = Color(0xFF3498DB);
@@ -85,38 +93,101 @@ class FinanceEntry {
       );
 }
 
+/// Last-write-wins merge keyed by id. Returns true when [target] changed.
+bool mergeEntries(Map<String, FinanceEntry> target, Iterable<FinanceEntry> incoming) {
+  var changed = false;
+  for (final entry in incoming) {
+    final current = target[entry.id];
+    if (current == null || entry.updatedAt.isAfter(current.updatedAt)) {
+      target[entry.id] = entry;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+typedef AuthOutcome = ({String? error, String? info});
+
+/// Local-first store.
+///
+/// * Signed out ("guest"): records live in the legacy local key and work fully offline.
+/// * Signed in: each account has its own local bucket, so accounts never mix on one
+///   device and nothing is deleted on sign-out. On sign-in the account's cloud
+///   records are merged into the local bucket, guest records created offline are
+///   adopted into the account, and everything newer locally is uploaded.
 class FinanceStore extends ChangeNotifier {
-  static const _entriesKey = 'finance.entries.v1';
   static const _currencyKey = 'finance.currency.v1';
+  static const _activeUserKey = 'finance.activeUser.v1';
   final _connectivity = Connectivity();
   final _uuid = const Uuid();
   final Map<String, FinanceEntry> _entries = {};
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
-  bool _syncing = false;
+  StreamSubscription<AuthState>? _authSubscription;
+  Timer? _retryTimer;
+  Future<void>? _syncFuture;
+  Future<void> _authQueue = Future<void>.value();
   bool _syncRequested = false;
+  bool _syncing = false;
+  bool _syncFailed = false;
   bool _online = false;
+  bool _bucketLoaded = false;
+  String? _userId;
+  String? _userEmail;
   String currency = 'UZS';
+  DateTime? lastSyncedAt;
 
   bool get syncConfigured => _supabaseUrl.isNotEmpty && _supabaseAnonKey.isNotEmpty;
   bool get online => _online;
   bool get syncing => _syncing;
+  bool get syncFailed => _syncFailed;
+  bool get signedIn => _userId != null;
+  String? get userEmail => _userEmail;
   List<FinanceEntry> get entries => _entries.values
       .where((entry) => !entry.deleted)
       .toList()
     ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
+  String _bucketKey(String? userId) => userId == null ? _guestEntriesKey : '$_guestEntriesKey.user.$userId';
+
   Future<void> load() async {
     final preferences = await SharedPreferences.getInstance();
     currency = preferences.getString(_currencyKey) ?? 'UZS';
-    final saved = preferences.getString(_entriesKey);
-    if (saved != null) {
-      final list = jsonDecode(saved) as List<dynamic>;
-      for (final row in list) {
-        final entry = FinanceEntry.fromJson(row as Map<String, dynamic>);
-        _entries[entry.id] = entry;
+
+    String? userId;
+    String? email;
+    if (syncConfigured) {
+      final client = Supabase.instance.client;
+      var user = client.auth.currentUser;
+      if (user != null && user.isAnonymous) {
+        // Older builds used anonymous identities. Their data is already on this
+        // device (guest bucket) and is adopted into the account on first sign-in.
+        user = null;
+        try {
+          await client.auth.signOut();
+        } catch (_) {}
+      }
+      userId = user?.id;
+      email = user?.email;
+      if (user == null) {
+        // Offline cold start can leave the SDK without a session while the user is
+        // still "signed in" from their point of view; keep showing their data.
+        final remembered = preferences.getString(_activeUserKey);
+        if (remembered != null) {
+          final json = jsonDecode(remembered) as Map<String, dynamic>;
+          userId = json['id'] as String?;
+          email = json['email'] as String?;
+        }
       }
     }
+    await _activate(userId, email);
     notifyListeners();
+
+    if (syncConfigured) {
+      _authSubscription = Supabase.instance.client.auth.onAuthStateChange.listen(
+        (state) => _enqueueAuth(state.event),
+        onError: (_) {},
+      );
+    }
     final results = await _connectivity.checkConnectivity();
     _online = results.any((result) => result != ConnectivityResult.none);
     _connectivitySubscription = _connectivity.onConnectivityChanged.listen((results) {
@@ -125,6 +196,76 @@ class FinanceStore extends ChangeNotifier {
       if (_online) unawaited(sync());
     });
     if (_online) unawaited(sync());
+  }
+
+  void _enqueueAuth(AuthChangeEvent event) {
+    _authQueue = _authQueue.then((_) async {
+      final client = Supabase.instance.client;
+      final user = client.auth.currentUser;
+      if (user != null && !user.isAnonymous) {
+        await _rememberUser(user.id, user.email);
+        if (await _activate(user.id, user.email)) notifyListeners();
+        if (event != AuthChangeEvent.tokenRefreshed) unawaited(sync());
+      } else if (event == AuthChangeEvent.signedOut) {
+        await _rememberUser(null, null);
+        if (await _activate(null, null)) notifyListeners();
+      }
+    }).catchError((_) {});
+  }
+
+  Future<void> _rememberUser(String? id, String? email) async {
+    final preferences = await SharedPreferences.getInstance();
+    if (id == null) {
+      await preferences.remove(_activeUserKey);
+    } else {
+      await preferences.setString(_activeUserKey, jsonEncode({'id': id, 'email': email}));
+    }
+  }
+
+  /// Switches the in-memory records to [userId]'s local bucket (null = guest).
+  /// Returns false when that bucket was already active.
+  Future<bool> _activate(String? userId, String? email) async {
+    if (_bucketLoaded && userId == _userId) {
+      if (_userEmail != email) {
+        _userEmail = email;
+        return true;
+      }
+      return false;
+    }
+    _retryTimer?.cancel();
+    _syncFailed = false;
+    lastSyncedAt = null;
+    _userId = userId;
+    _userEmail = email;
+    _entries.clear();
+    final preferences = await SharedPreferences.getInstance();
+    _readBucket(preferences, _bucketKey(userId));
+    if (userId != null) {
+      // Adopt records created while signed out (e.g. offline) into this account.
+      // Written to the account bucket first, guest bucket removed only afterwards.
+      final adopted = _readBucketInto(preferences, _guestEntriesKey);
+      if (adopted.isNotEmpty) {
+        mergeEntries(_entries, adopted.values);
+        await _persist(notify: false);
+        await preferences.remove(_guestEntriesKey);
+      }
+    }
+    _bucketLoaded = true;
+    return true;
+  }
+
+  void _readBucket(SharedPreferences preferences, String key) =>
+      _entries.addAll(_readBucketInto(preferences, key));
+
+  Map<String, FinanceEntry> _readBucketInto(SharedPreferences preferences, String key) {
+    final result = <String, FinanceEntry>{};
+    final saved = preferences.getString(key);
+    if (saved == null) return result;
+    for (final row in jsonDecode(saved) as List<dynamic>) {
+      final entry = FinanceEntry.fromJson(row as Map<String, dynamic>);
+      result[entry.id] = entry;
+    }
+    return result;
   }
 
   Future<void> setCurrency(String value) async {
@@ -172,61 +313,177 @@ class FinanceStore extends ChangeNotifier {
     if (_online) unawaited(sync());
   }
 
-  Future<void> sync() async {
-    if (!syncConfigured || !_online) return;
-    if (_syncing) {
-      _syncRequested = true;
-      return;
+  // ---- Auth -------------------------------------------------------------
+
+  Future<AuthOutcome> signInWithEmail(String email, String password) async {
+    if (!syncConfigured) return (error: 'Cloud sync is not configured in this build.', info: null);
+    try {
+      await Supabase.instance.client.auth.signInWithPassword(email: email, password: password);
+      return (error: null, info: null);
+    } on AuthException catch (error) {
+      return (error: error.message, info: null);
+    } catch (_) {
+      return (error: 'Could not reach the server. Check your internet connection.', info: null);
     }
+  }
+
+  Future<AuthOutcome> signUpWithEmail(String email, String password) async {
+    if (!syncConfigured) return (error: 'Cloud sync is not configured in this build.', info: null);
+    try {
+      final response = await Supabase.instance.client.auth.signUp(
+        email: email,
+        password: password,
+        emailRedirectTo: _authRedirect,
+      );
+      // With email confirmation on, an already-registered address returns a user
+      // with no identities instead of an error.
+      if (response.user?.identities?.isEmpty ?? false) {
+        return (error: 'An account with this email already exists. Sign in instead.', info: null);
+      }
+      if (response.session == null) {
+        return (error: null, info: 'Account created. Open the confirmation link we emailed you, then sign in.');
+      }
+      return (error: null, info: null);
+    } on AuthException catch (error) {
+      return (error: error.message, info: null);
+    } catch (_) {
+      return (error: 'Could not reach the server. Check your internet connection.', info: null);
+    }
+  }
+
+  /// Opens the Google consent page in the browser. The session arrives through
+  /// the deep link, which the Supabase SDK turns into an auth state change.
+  Future<AuthOutcome> signInWithGoogle() async {
+    if (!syncConfigured) return (error: 'Cloud sync is not configured in this build.', info: null);
+    try {
+      final launched = await Supabase.instance.client.auth.signInWithOAuth(
+        OAuthProvider.google,
+        redirectTo: _authRedirect,
+        authScreenLaunchMode: LaunchMode.externalApplication,
+      );
+      return launched ? (error: null, info: null) : (error: 'Could not open the Google sign-in page.', info: null);
+    } on AuthException catch (error) {
+      return (error: error.message, info: null);
+    } catch (_) {
+      return (error: 'Could not open the Google sign-in page.', info: null);
+    }
+  }
+
+  /// Uploads outstanding changes (when online), then signs out. Local records stay
+  /// on the device in the account's own bucket and come back on the next sign-in.
+  Future<void> signOut() async {
+    if (_online) {
+      try {
+        await sync();
+      } catch (_) {}
+    }
+    try {
+      await Supabase.instance.client.auth.signOut();
+    } catch (_) {}
+    await _rememberUser(null, null);
+    _authQueue = _authQueue.then((_) async {
+      if (await _activate(null, null)) notifyListeners();
+    }).catchError((_) {});
+    await _authQueue;
+  }
+
+  // ---- Sync -------------------------------------------------------------
+
+  /// Two-way sync: pull the account's cloud records into local storage, then push
+  /// every local record the cloud is missing or has an older version of.
+  Future<void> sync() {
+    if (!syncConfigured || !_online || _userId == null) return Future<void>.value();
+    final running = _syncFuture;
+    if (running != null) {
+      _syncRequested = true;
+      return running;
+    }
+    return _syncFuture = _runSync().whenComplete(() {
+      _syncFuture = null;
+      if (_syncRequested) {
+        _syncRequested = false;
+        unawaited(sync());
+      }
+    });
+  }
+
+  Future<void> _runSync() async {
+    final userId = _userId!;
     _syncing = true;
     notifyListeners();
     try {
       final client = Supabase.instance.client;
       if (client.auth.currentSession == null) {
-        await client.auth.signInAnonymously();
+        // The app started offline, so the SDK could not refresh the saved session and
+        // left it unset. Now that we are online, restore it from the SDK's own storage.
+        final preferences = await SharedPreferences.getInstance();
+        final saved = preferences.getString(_sessionStorageKey);
+        if (saved == null) throw StateError('No saved session');
+        await client.auth.recoverSession(saved);
       }
-      final userId = client.auth.currentUser!.id;
-      final remote = await client.from('transactions').select();
-      var changed = false;
-      for (final row in remote) {
-        final incoming = FinanceEntry.fromJson(row);
-        final local = _entries[incoming.id];
-        if (local == null || incoming.updatedAt.isAfter(local.updatedAt)) {
-          _entries[incoming.id] = incoming;
-          changed = true;
+      final authUser = client.auth.currentUser;
+      if (authUser == null || authUser.id != userId) throw StateError('No active session');
+
+      final remote = <String, FinanceEntry>{};
+      const pageSize = 1000;
+      for (var from = 0;; from += pageSize) {
+        final page = await client
+            .from('transactions')
+            .select()
+            .order('created_at')
+            .order('id')
+            .range(from, from + pageSize - 1);
+        for (final row in page) {
+          final entry = FinanceEntry.fromJson(row);
+          remote[entry.id] = entry;
         }
+        if (page.length < pageSize) break;
       }
-      if (_entries.isNotEmpty) {
-        await client.from('transactions').upsert(
-              _entries.values.map((entry) => entry.toJson(userId: userId)).toList(),
-              onConflict: 'id',
-            );
-      }
+      if (_userId != userId) return; // account changed while fetching
+
+      final changed = mergeEntries(_entries, remote.values);
       if (changed) await _persist();
+
+      final outgoing = _entries.values.where((entry) {
+        final cloud = remote[entry.id];
+        return cloud == null || entry.updatedAt.isAfter(cloud.updatedAt);
+      }).toList();
+      for (var i = 0; i < outgoing.length; i += 200) {
+        final batch = outgoing.skip(i).take(200).map((entry) => entry.toJson(userId: userId)).toList();
+        await client.from('transactions').upsert(batch, onConflict: 'id');
+      }
+      _syncFailed = false;
+      lastSyncedAt = DateTime.now();
+      _retryTimer?.cancel();
     } catch (_) {
-      // Preserve local data; a later connection event retries sync.
+      // Local data is untouched. Retry shortly; connectivity events also retry.
+      if (_userId == userId) {
+        _syncFailed = true;
+        _retryTimer?.cancel();
+        _retryTimer = Timer(const Duration(seconds: 30), () => unawaited(sync()));
+      }
     } finally {
       _syncing = false;
       notifyListeners();
-      if (_syncRequested) {
-        _syncRequested = false;
-        unawaited(sync());
-      }
     }
   }
 
-  Future<void> _persist() async {
+  Future<void> _persist({bool notify = true}) async {
     final preferences = await SharedPreferences.getInstance();
+    // Key and records are read together, after the await, so a concurrent account
+    // switch can never write one account's records into another's bucket.
     await preferences.setString(
-      _entriesKey,
+      _bucketKey(_userId),
       jsonEncode(_entries.values.map((entry) => entry.toJson()).toList()),
     );
-    notifyListeners();
+    if (notify) notifyListeners();
   }
 
   @override
   void dispose() {
+    _retryTimer?.cancel();
     _connectivitySubscription?.cancel();
+    _authSubscription?.cancel();
     super.dispose();
   }
 }
@@ -238,20 +495,27 @@ class FinanceApp extends StatefulWidget {
   State<FinanceApp> createState() => _FinanceAppState();
 }
 
-class _FinanceAppState extends State<FinanceApp> {
+class _FinanceAppState extends State<FinanceApp> with WidgetsBindingObserver {
   final _store = FinanceStore();
   bool _ready = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _store.load().then((_) {
       if (mounted) setState(() => _ready = true);
     });
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _ready) unawaited(_store.sync());
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _store.dispose();
     super.dispose();
   }
@@ -347,8 +611,24 @@ class _SyncIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final text = store.syncing ? 'Syncing' : !store.syncConfigured ? 'Device only' : store.online ? 'Synced' : 'Offline';
-    final dot = store.syncing ? _blue : !store.syncConfigured ? _muted : store.online ? _green : _red;
+    final text = store.syncing
+        ? 'Syncing'
+        : !store.syncConfigured
+            ? 'Device only'
+            : !store.signedIn
+                ? 'Not signed in'
+                : !store.online
+                    ? 'Offline'
+                    : store.syncFailed
+                        ? 'Sync failed'
+                        : 'Synced';
+    final dot = store.syncing
+        ? _blue
+        : !store.syncConfigured || !store.signedIn
+            ? _muted
+            : !store.online || store.syncFailed
+                ? _red
+                : _green;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -744,6 +1024,25 @@ class _SettingsPage extends StatelessWidget {
   const _SettingsPage({required this.store});
   final FinanceStore store;
 
+  Future<void> _confirmSignOut(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Sign out?'),
+        content: Text(
+          store.online
+              ? 'Your latest changes will be uploaded first. Your records stay on this device in your account and return when you sign in again.'
+              : 'You are offline, so recent changes cannot be uploaded now. They stay safely on this device and upload the next time you sign in while online.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Sign out')),
+        ],
+      ),
+    );
+    if (confirmed == true) await store.signOut();
+  }
+
   @override
   Widget build(BuildContext context) => ListView(
         padding: const EdgeInsets.all(18),
@@ -766,7 +1065,7 @@ class _SettingsPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 25),
-          const _SectionHeading(title: 'Data and sync'),
+          const _SectionHeading(title: 'Account and sync'),
           const SizedBox(height: 10),
           Container(
             padding: const EdgeInsets.all(15),
@@ -774,17 +1073,58 @@ class _SettingsPage extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(children: [Icon(store.syncConfigured ? Icons.cloud_done_outlined : Icons.phone_android, color: store.syncConfigured ? _green : _blue), const SizedBox(width: 10), Expanded(child: Text(store.syncConfigured ? 'Private device sync' : 'Stored on this device', style: const TextStyle(color: _ink, fontWeight: FontWeight.w700)))]),
+                Row(children: [
+                  Icon(
+                    !store.syncConfigured ? Icons.phone_android : store.signedIn ? Icons.cloud_done_outlined : Icons.cloud_off_outlined,
+                    color: store.signedIn ? _green : _blue,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      !store.syncConfigured ? 'Stored on this device' : store.signedIn ? (store.userEmail ?? 'Signed in') : 'Not signed in',
+                      style: const TextStyle(color: _ink, fontWeight: FontWeight.w700),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ]),
                 const SizedBox(height: 8),
                 Text(
-                  store.syncConfigured
-                      ? 'Changes are saved here first and synced when you are online. Your anonymous device profile has no sign-in or recovery option.'
-                      : 'Your records are saved locally and work offline. Connect a Supabase project at build time to enable cloud sync. Removing app data or changing devices will not transfer local-only records.',
+                  !store.syncConfigured
+                      ? 'Your records are saved locally and work offline. Connect a Supabase project at build time to enable accounts and cloud sync.'
+                      : store.signedIn
+                          ? 'Records are saved on this device first. They upload automatically whenever you are online, and your cloud records are downloaded here, so nothing is lost if you go offline.'
+                          : 'Records are saved on this device and work offline. Sign in to back them up and sync across devices. Everything already on this device is uploaded to your account.',
                   style: const TextStyle(color: _muted, height: 1.45, fontSize: 12),
                 ),
+                if (store.signedIn && store.lastSyncedAt != null) ...[
+                  const SizedBox(height: 6),
+                  Text('Last synced ${DateFormat('d MMM, HH:mm').format(store.lastSyncedAt!)}', style: const TextStyle(color: _muted, fontSize: 11)),
+                ],
+                if (store.signedIn && store.syncFailed) ...[
+                  const SizedBox(height: 6),
+                  const Text('The last sync did not complete. It will retry automatically.', style: TextStyle(color: _red, fontSize: 11)),
+                ],
                 if (store.syncConfigured) ...[
                   const SizedBox(height: 13),
-                  OutlinedButton.icon(onPressed: store.online ? store.sync : null, icon: const Icon(Icons.sync, size: 18), label: const Text('Sync now')),
+                  if (store.signedIn)
+                    Wrap(
+                      spacing: 10,
+                      children: [
+                        OutlinedButton.icon(onPressed: store.online ? store.sync : null, icon: const Icon(Icons.sync, size: 18), label: const Text('Sync now')),
+                        TextButton.icon(
+                          onPressed: () => _confirmSignOut(context),
+                          icon: const Icon(Icons.logout, size: 18),
+                          label: const Text('Sign out'),
+                        ),
+                      ],
+                    )
+                  else
+                    FilledButton.icon(
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => AuthScreen(store: store))),
+                      style: FilledButton.styleFrom(backgroundColor: _blue),
+                      icon: const Icon(Icons.login, size: 18),
+                      label: const Text('Sign in or create account'),
+                    ),
                 ],
               ],
             ),
