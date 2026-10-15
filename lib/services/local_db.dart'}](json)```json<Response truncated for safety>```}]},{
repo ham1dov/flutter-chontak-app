@@ -1,0 +1,136 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:sqflite/sqflite.dart';
+
+class RecordingLocal {
+  RecordingLocal({
+    required this.id,
+    required this.localPath,
+    required this.title,
+    required this.userId,
+    required this.createdAt,
+    required this.updatedAt,
+    this.uploaded = 0,
+    this.remoteId,
+    this.deleted = 0,
+  });
+
+  final String id;
+  final String localPath;
+  final String title;
+  final String? userId;
+  final int createdAt;
+  final int updatedAt;
+  int uploaded; // 0/1
+  String? remoteId;
+  int deleted; // 0/1
+
+  Map<String, Object?> toMap() => {
+        'id': id,
+        'local_path': localPath,
+        'title': title,
+        'user_id': userId,
+        'created_at': createdAt,
+        'updated_at': updatedAt,
+        'uploaded': uploaded,
+        'remote_id': remoteId,
+        'deleted': deleted,
+      };
+
+  static RecordingLocal fromMap(Map<String, Object?> m) => RecordingLocal(
+        id: m['id'] as String,
+        localPath: m['local_path'] as String,
+        title: m['title'] as String,
+        userId: m['user_id'] as String?,
+        createdAt: m['created_at'] as int,
+        updatedAt: m['updated_at'] as int,
+        uploaded: (m['uploaded'] as int),
+        remoteId: m['remote_id'] as String?,
+        deleted: (m['deleted'] as int),
+      );
+}
+
+class LocalDb {
+  LocalDb._();
+  static final LocalDb instance = LocalDb._();
+
+  Database? _db;
+
+  Future<void> init() async {
+    if (_db != null) return;
+    final dir = await getApplicationDocumentsDirectory();
+    final dbPath = p.join(dir.path, 'app_data.db');
+    _db = await openDatabase(dbPath, version: 1, onCreate: (db, version) async {
+      await db.execute('''
+        CREATE TABLE recordings (
+          id TEXT PRIMARY KEY,
+          local_path TEXT NOT NULL,
+          title TEXT,
+          user_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          uploaded INTEGER DEFAULT 0,
+          remote_id TEXT,
+          deleted INTEGER DEFAULT 0
+        );
+      ''');
+    });
+  }
+
+  Future<void> close() async {
+    await _db?.close();
+    _db = null;
+  }
+
+  Future<String> saveFileBytes(String filename, List<int> bytes) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final recordingsDir = Directory(p.join(dir.path, 'recordings'));
+    if (!await recordingsDir.exists()) await recordingsDir.create(recursive: true);
+    final filePath = p.join(recordingsDir.path, filename);
+    final file = File(filePath);
+    await file.writeAsBytes(bytes, flush: true);
+    return filePath;
+  }
+
+  Future<void> insertRecording(RecordingLocal r) async {
+    await _db!.insert('recordings', r.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<List<RecordingLocal>> getPendingUploads() async {
+    final rows = await _db!.query('recordings', where: 'uploaded = 0 AND deleted = 0');
+    return rows.map((r) => RecordingLocal.fromMap(r)).toList();
+  }
+
+  Future<List<RecordingLocal>> getAllForUser(String userId) async {
+    final rows = await _db!.query('recordings', where: 'user_id = ?', whereArgs: [userId]);
+    return rows.map((r) => RecordingLocal.fromMap(r)).toList();
+  }
+
+  Future<RecordingLocal?> findByRemoteId(String remoteId) async {
+    final rows = await _db!.query('recordings', where: 'remote_id = ?', whereArgs: [remoteId], limit: 1);
+    if (rows.isEmpty) return null;
+    return RecordingLocal.fromMap(rows.first);
+  }
+
+  Future<RecordingLocal?> findById(String id) async {
+    final rows = await _db!.query('recordings', where: 'id = ?', whereArgs: [id], limit: 1);
+    if (rows.isEmpty) return null;
+    return RecordingLocal.fromMap(rows.first);
+  }
+
+  Future<void> markUploaded(String id, {required String remoteId}) async {
+    await _db!.update('recordings', {'uploaded': 1, 'remote_id': remoteId}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> setUserIdForLocal(String id, String userId) async {
+    await _db!.update('recordings', {'user_id': userId}, where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> insertRemoteAsLocal({required String id, required String storagePath, required String title, required String userId, required List<int> bytes, required int createdAt, required int updatedAt}) async {
+    final filePath = await saveFileBytes('$id.bin', bytes);
+    final r = RecordingLocal(id: id, localPath: filePath, title: title, userId: userId, createdAt: createdAt, updatedAt: updatedAt, uploaded: 1, remoteId: id);
+    await insertRecording(r);
+  }
+}
